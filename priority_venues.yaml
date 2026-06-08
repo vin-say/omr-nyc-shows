@@ -1,0 +1,22 @@
+# Priority venues for newsletter scoring.
+# Shows at these venues are boosted in the newsletter ranking.
+# Edit this list freely — names must match the venue names in the database exactly.
+
+priority_venues:
+  - Knockdown Center
+  - Elsewhere
+  - Baby's All Right
+  - Public Records
+  - Music Hall of Williamsburg
+  - Brooklyn Paramount
+  - Pioneer Works
+  - Market Hotel
+  - (Le) Poisson Rouge
+  - Bowery Ballroom
+  - National Sawdust
+  - The Meadows
+  - Brooklyn Steel
+  - The Wood Shop
+  - Brooklyn Monarch
+  - Warsaw
+  - Roulette

@@ -1,0 +1,425 @@
+"""
+Newsletter generator for NYC Concert Tracker.
+
+Reads show data from concerts.db, scores each show into one of four tiers
+based on venue priority and artist media coverage, then renders a Markdown
+newsletter and converts it to an HTML email.
+
+Tiers (highest to lowest):
+  1. Priority venue AND at least one artist with media coverage
+  2. At least one artist with media coverage (non-priority venue)
+  3. Priority venue (no artist media coverage)
+  4. Everything else
+
+Usage:
+    python generate_newsletter.py              # writes output/ files
+    python generate_newsletter.py --db path    # custom DB path
+"""
+
+import sqlite3
+import os
+import re
+import argparse
+from datetime import datetime
+
+import yaml
+import markdown
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB = os.path.join(SCRIPT_DIR, "concerts.db")
+PRIORITY_VENUES_FILE = os.path.join(SCRIPT_DIR, "priority_venues.yaml")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
+
+PUBLICATIONS = [
+    "Pitchfork",
+    "Brooklyn Vegan",
+    "Bandcamp Daily",
+    "Resident Advisor",
+    "KEXP",
+]
+
+# Phrases that indicate NO coverage when found on the same line as a
+# publication name.  If none of these appear, we assume coverage exists.
+_NEGATIVE_PHRASES = [
+    "no evidence",
+    "not find",
+    "no coverage",
+    "not appear",
+    "no specific",
+    "not featured",
+    "could not",
+    "no direct",
+    "no mention",
+    "not mentioned",
+    "no results",
+    "not covered",
+    "couldn't find",
+    "couldn't verify",
+    "no confirmed",
+    "cannot confirm",
+    "no kexp coverage",
+]
+
+TIER_LABELS = {
+    1: "Priority Venue + Media Coverage",
+    2: "Media Coverage",
+    3: "Priority Venue",
+    4: "Other Shows",
+}
+
+
+# ---------------------------------------------------------------------------
+# Loading helpers
+# ---------------------------------------------------------------------------
+def load_priority_venues(path: str = PRIORITY_VENUES_FILE) -> set[str]:
+    """Load the priority venue list from the YAML config file."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    venues = data.get("priority_venues", [])
+    # Normalise to lowercase for case-insensitive matching
+    return {v.strip().lower() for v in venues}
+
+
+def _has_media_coverage(report: str | None) -> bool:
+    """
+    Determine whether an artist's Perplexity report indicates coverage
+    in at least one of the target publications.
+
+    Strategy: for each publication, find the line that mentions it.
+    If the line does NOT contain any of the known negative phrases,
+    the artist is considered to have coverage for that outlet.
+    """
+    if not report:
+        return False
+
+    lines = report.split("\n")
+    for pub in PUBLICATIONS:
+        pub_lower = pub.lower()
+        for line in lines:
+            if pub_lower in line.lower():
+                line_lower = line.lower()
+                is_negative = any(neg in line_lower for neg in _NEGATIVE_PHRASES)
+                if not is_negative:
+                    return True
+                break  # move to next publication
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+def load_shows(conn: sqlite3.Connection, since_date: str | None = None) -> list[dict]:
+    """
+    Load shows with their venue, artists, reports, and ticket info.
+
+    Args:
+        conn: SQLite connection.
+        since_date: If provided (ISO date string like '2026-06-01'), only
+                    returns shows with announcement_date > since_date.
+                    If None, returns all shows.
+
+    Returns a list of show dicts, each with nested artist list.
+    """
+    cursor = conn.cursor()
+
+    # Fetch shows with venue info, optionally filtered by announcement date
+    if since_date:
+        cursor.execute("""
+            SELECT s.id, s.show_date, s.ticket_url, s.source_url,
+                   v.name AS venue_name
+            FROM shows s
+            JOIN venues v ON v.id = s.venue_id
+            WHERE s.announcement_date > ?
+            ORDER BY s.show_date
+        """, (since_date,))
+    else:
+        cursor.execute("""
+            SELECT s.id, s.show_date, s.ticket_url, s.source_url,
+                   v.name AS venue_name
+            FROM shows s
+            JOIN venues v ON v.id = s.venue_id
+            ORDER BY s.show_date
+        """)
+    shows_raw = cursor.fetchall()
+
+    shows = []
+    for show_id, show_date, ticket_url, source_url, venue_name in shows_raw:
+        # Fetch artists for this show, ordered by bill position
+        cursor.execute("""
+            SELECT a.name, a.report, sa.bill_order
+            FROM show_artists sa
+            JOIN artists a ON a.id = sa.artist_id
+            WHERE sa.show_id = ?
+            ORDER BY sa.bill_order
+        """, (show_id,))
+        artists = [
+            {"name": name, "report": report, "bill_order": bill_order}
+            for name, report, bill_order in cursor.fetchall()
+        ]
+
+        shows.append({
+            "id": show_id,
+            "show_date": show_date,
+            "ticket_url": ticket_url,
+            "source_url": source_url,
+            "venue": venue_name,
+            "artists": artists,
+        })
+
+    return shows
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+def score_show(show: dict, priority_venues: set[str]) -> int:
+    """
+    Assign a tier (1–4) to a show.
+
+    1 = priority venue AND media coverage
+    2 = media coverage only
+    3 = priority venue only
+    4 = neither
+    """
+    is_priority = show["venue"].strip().lower() in priority_venues
+    has_coverage = any(
+        _has_media_coverage(a["report"]) for a in show["artists"]
+    )
+
+    if is_priority and has_coverage:
+        return 1
+    elif has_coverage:
+        return 2
+    elif is_priority:
+        return 3
+    else:
+        return 4
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+def _format_date(date_str: str) -> str:
+    """Convert YYYY-MM-DD to a human-readable date with day name."""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%A, %B %-d, %Y")
+    except (ValueError, AttributeError):
+        # %-d is not supported on Windows; fall back to %#d
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            return dt.strftime("%A, %B %#d, %Y")
+        except Exception:
+            return date_str
+
+
+def _render_show_markdown(show: dict) -> str:
+    """Render a single show as a Markdown section."""
+    lines = []
+
+    # Headline: lineup @ venue
+    lineup = ", ".join(a["name"] for a in show["artists"])
+    lines.append(f"### {lineup}")
+    lines.append(f"**{show['venue']}** — {_format_date(show['show_date'])}")
+    lines.append("")
+
+    # Ticket link
+    if show["ticket_url"]:
+        lines.append(f"[Tickets]({show['ticket_url']})")
+        lines.append("")
+
+    # Artist reports (for every artist that has one)
+    artists_with_reports = [a for a in show["artists"] if a["report"]]
+    for artist in artists_with_reports:
+        report = artist["report"].strip()
+
+        # If only one artist has a report, no need for a sub-heading
+        if len(artists_with_reports) > 1:
+            lines.append(f"**About {artist['name']}:**")
+            lines.append("")
+
+        # Indent the report into a blockquote so it's visually distinct
+        for report_line in report.split("\n"):
+            lines.append(f"> {report_line}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_newsletter_markdown(
+    shows: list[dict], priority_venues: set[str]
+) -> str:
+    """
+    Score all shows, sort them by tier then date, and render the full
+    newsletter as Markdown.
+    """
+    # Score and group
+    scored = []
+    for show in shows:
+        tier = score_show(show, priority_venues)
+        scored.append((tier, show))
+
+    # Sort by tier (ascending = highest priority first), then by date
+    scored.sort(key=lambda x: (x[0], x[1]["show_date"]))
+
+    # Build the document
+    today = datetime.now().strftime("%B %#d, %Y")
+    parts = [
+        f"# NYC Concert Tracker — New Announcements",
+        f"*Generated {today}*",
+        "",
+    ]
+
+    # Tier summary counts
+    tier_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    for tier, _ in scored:
+        tier_counts[tier] += 1
+
+    parts.append(
+        f"**{len(shows)} shows** — "
+        f"{tier_counts[1]} top picks, "
+        f"{tier_counts[2]} media-covered, "
+        f"{tier_counts[3]} priority venue, "
+        f"{tier_counts[4]} other"
+    )
+    parts.append("")
+
+    current_tier = None
+    for tier, show in scored:
+        if tier != current_tier:
+            current_tier = tier
+            parts.append(f"## {TIER_LABELS[tier]}")
+            parts.append("")
+        parts.append(_render_show_markdown(show))
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# HTML conversion
+# ---------------------------------------------------------------------------
+HTML_WRAPPER = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NYC Concert Tracker</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 Helvetica, Arial, sans-serif;
+    max-width: 700px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    color: #1a1a1a;
+    line-height: 1.6;
+  }}
+  h1 {{
+    border-bottom: 3px solid #1a1a1a;
+    padding-bottom: 0.4rem;
+  }}
+  h2 {{
+    color: #b33;
+    margin-top: 2.5rem;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 0.3rem;
+  }}
+  h3 {{
+    margin-bottom: 0.2rem;
+  }}
+  blockquote {{
+    border-left: 3px solid #ccc;
+    margin: 0.5rem 0 1rem 0;
+    padding: 0.4rem 0.8rem;
+    color: #444;
+    background: #fafafa;
+    font-size: 0.92em;
+  }}
+  blockquote h2 {{
+    color: #444;
+    font-size: 1em;
+    border-bottom: none;
+    margin-top: 0.8rem;
+  }}
+  a {{
+    color: #b33;
+  }}
+  hr {{
+    border: none;
+    border-top: 1px solid #eee;
+    margin: 1.5rem 0;
+  }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def convert_to_html(md_text: str) -> str:
+    """Convert Markdown newsletter to a self-contained HTML email."""
+    body = markdown.markdown(md_text, extensions=["extra"])
+    return HTML_WRAPPER.format(body=body)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Generate concert newsletter")
+    parser.add_argument("--db", default=DEFAULT_DB, help="Path to concerts.db")
+    parser.add_argument(
+        "--since",
+        default=None,
+        help="Only include shows announced after this date (ISO format, e.g. 2026-06-01)",
+    )
+    args = parser.parse_args()
+
+    # Load data
+    priority_venues = load_priority_venues()
+    conn = sqlite3.connect(args.db)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    shows = load_shows(conn, since_date=args.since)
+    conn.close()
+
+    print(f"Loaded {len(shows)} shows and {len(priority_venues)} priority venues.")
+
+    # Generate
+    md_text = render_newsletter_markdown(shows, priority_venues)
+    html_text = convert_to_html(md_text)
+
+    # Write output
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    md_path = os.path.join(OUTPUT_DIR, "newsletter.md")
+    html_path = os.path.join(OUTPUT_DIR, "newsletter.html")
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+
+    print(f"Newsletter written to:\n  Markdown: {md_path}\n  HTML:     {html_path}")
+
+    # Print tier breakdown
+    tier_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    for show in shows:
+        tier = score_show(show, priority_venues)
+        tier_counts[tier] += 1
+
+    print("\nTier breakdown:")
+    for tier in range(1, 5):
+        print(f"  {TIER_LABELS[tier]}: {tier_counts[tier]}")
+
+
+if __name__ == "__main__":
+    main()
