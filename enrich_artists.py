@@ -1,7 +1,8 @@
 """
 Artist enrichment module using Perplexity Sonar API.
 
-For each eligible artist, queries Sonar to produce a Markdown report covering:
+For each eligible artist, queries Sonar to produce a structured JSON report
+covering:
   - Genre(s) associated with the artist
   - Whether the artist has been discussed or featured in:
     Pitchfork, Brooklyn Vegan, Bandcamp Daily, Resident Advisor, KEXP
@@ -13,8 +14,9 @@ position on the bill (bill_order in show_artists):
   - Large / Major venues:        all artists on the bill
   - Unknown / NULL tier:          all artists (always enrich)
 
-The final Markdown report is stored in artists.report and includes a
-Sources section built from the Perplexity response's citations array.
+The structured JSON is stored in artists.coverage_json.  The Perplexity
+citations array is embedded in the JSON so the newsletter renderer can
+produce inline hyperlinks.
 """
 
 import sqlite3
@@ -32,7 +34,7 @@ from curl_cffi import requests as cffi_requests
 # ---------------------------------------------------------------------------
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
 PERPLEXITY_MODEL = "sonar"
-SEARCH_CONTEXT_SIZE = "medium"
+SEARCH_CONTEXT_SIZE = "high"
 DELAY_BETWEEN_CALLS = 1  # seconds between API calls
 
 PUBLICATIONS = [
@@ -57,34 +59,107 @@ def _load_perplexity_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# JSON schema for structured output
+# ---------------------------------------------------------------------------
+ARTIST_JSON_SCHEMA = {
+    "name": "artist_info",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "genres": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Specific genres associated with this artist, e.g. "
+                    "'post-punk', 'ambient jazz', 'indie folk'. "
+                    "Be specific rather than broad."
+                ),
+            },
+            "coverage": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "publication": {
+                            "type": "string",
+                            "description": "Name of the publication.",
+                        },
+                        "covered": {
+                            "type": "boolean",
+                            "description": (
+                                "true if you found evidence that this publication "
+                                "has discussed, reviewed, or featured the artist. "
+                                "false if you found no such evidence."
+                            ),
+                        },
+                        "context": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Brief description of the coverage if covered is true "
+                                "(e.g. 'album review of Punisher', 'live in-studio session', "
+                                "'interview about upcoming tour'). null if covered is false."
+                            ),
+                        },
+                        "citation_index": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                "The 1-based citation number that supports this coverage claim "
+                                "(e.g. 1 for [1], 2 for [2]). null if covered is false or "
+                                "no specific citation applies."
+                            ),
+                        },
+                    },
+                    "required": ["publication", "covered", "context", "citation_index"],
+                    "additionalProperties": False,
+                },
+                "description": "Coverage status for each of the requested publications.",
+            },
+        },
+        "required": ["genres", "coverage"],
+        "additionalProperties": False,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
 def _build_prompt(artist_name: str) -> str:
     pubs_list = ", ".join(PUBLICATIONS)
     return (
         f'Research the musical artist or band "{artist_name}".\n\n'
-        f"Provide a short Markdown-formatted report covering:\n\n"
-        f"1. **Genres**: List the genre(s) most commonly associated with this "
-        f"artist. Be specific (e.g. \"post-punk\" rather than just \"rock\").\n\n"
-        f"2. **Media Coverage**: For each of the following publications, state "
-        f"whether the artist has been discussed, reviewed, or featured there. "
-        f"Include the context of the coverage if available (e.g. album review, "
-        f"interview, live session, playlist feature):\n"
-        f"   - {pubs_list}\n\n"
-        f"Use inline citation numbers (e.g. [1], [2]) to reference your sources. "
-        f"If you cannot find evidence of coverage in a particular publication, "
-        f"say so explicitly — do not guess."
+        f"Provide a JSON object with two fields:\n\n"
+        f"1. **genres**: An array of specific genre labels most commonly "
+        f"associated with this artist (e.g. \"post-punk\" rather than just "
+        f"\"rock\"). Include 2-5 genres.\n\n"
+        f"2. **coverage**: For each of the following publications, determine "
+        f"whether the artist has been discussed, reviewed, or featured:\n"
+        f"   {pubs_list}\n\n"
+        f"   You may set covered=true based on EITHER:\n"
+        f"   - Direct evidence from search results (preferred — include the "
+        f"citation_index if available)\n"
+        f"   - Your training knowledge that the publication has covered this "
+        f"artist (e.g. you know Pitchfork reviewed their album, even if the "
+        f"specific URL wasn't in search results)\n\n"
+        f"   Only set covered=false if you genuinely have no knowledge or "
+        f"evidence of coverage. When in doubt for well-known artists, lean "
+        f"toward true. For obscure/unknown artists, lean toward false.\n\n"
+        f"   When covered=true, provide context describing the type of coverage "
+        f"(album review, interview, live session, etc.). Set citation_index to "
+        f"the relevant source number if one exists, or null if based on general "
+        f"knowledge."
     )
 
 
 # ---------------------------------------------------------------------------
 # Calling Perplexity
 # ---------------------------------------------------------------------------
-def _call_perplexity(artist_name: str, api_key: str) -> tuple[str, list[str]] | None:
+def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
     """
-    Call Perplexity Sonar for a single artist.
+    Call Perplexity Sonar for a single artist with structured JSON output.
 
-    Returns (content_markdown, citations_list) on success, or None on failure.
+    Returns a dict with keys: genres, coverage, citations.
+    Returns None on failure.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -97,9 +172,12 @@ def _call_perplexity(artist_name: str, api_key: str) -> tuple[str, list[str]] | 
             {
                 "role": "system",
                 "content": (
-                    "You are a music research assistant. Return well-structured "
-                    "Markdown. Use inline citation numbers like [1], [2] to "
-                    "reference your sources. Be concise but thorough."
+                    "You are a music research assistant. Return structured JSON "
+                    "about musical artists. Use both your search results AND your "
+                    "training knowledge to determine publication coverage. "
+                    "If you know from training data that a major publication like "
+                    "Pitchfork or KEXP has covered an artist, report that as "
+                    "covered=true even if the specific URL isn't in search results."
                 ),
             },
             {
@@ -109,6 +187,10 @@ def _call_perplexity(artist_name: str, api_key: str) -> tuple[str, list[str]] | 
         ],
         "web_search_options": {
             "search_context_size": SEARCH_CONTEXT_SIZE,
+        },
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": ARTIST_JSON_SCHEMA,
         },
     }
 
@@ -139,30 +221,30 @@ def _call_perplexity(artist_name: str, api_key: str) -> tuple[str, list[str]] | 
         print(f"   [!] Failed to decode API response for '{artist_name}': {e}")
         return None
 
+    # Extract the structured JSON content
     try:
         content = body["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
         print(f"   [!] Unexpected API response structure for '{artist_name}': {e}")
         return None
 
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"   [!] Invalid JSON in API response for '{artist_name}': {e}")
+        print(f"       Raw content: {content[:200]}")
+        return None
+
+    # Validate expected keys
+    if "genres" not in data or "coverage" not in data:
+        print(f"   [!] Missing required keys in response for '{artist_name}'")
+        return None
+
+    # Attach the citations array from the Perplexity response
     citations = body.get("citations", [])
+    data["citations"] = citations
 
-    return content, citations
-
-
-def _build_report(content: str, citations: list[str]) -> str:
-    """
-    Combine the Perplexity Markdown content with a Sources section that
-    maps the inline [1], [2], … references to their actual URLs.
-    """
-    if not citations:
-        return content
-
-    sources_section = "\n\n---\n\n## Sources\n\n"
-    for i, url in enumerate(citations, 1):
-        sources_section += f"{i}. {url}\n"
-
-    return content + sources_section
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -225,26 +307,31 @@ def enrich_unenriched_artists(conn: sqlite3.Connection):
             fail_count += 1
             continue
 
-        content, citations = result
-        report = _build_report(content, citations)
+        coverage_json = json.dumps(result, ensure_ascii=False)
         timestamp = datetime.now(timezone.utc).isoformat()
 
         cursor.execute(
             """
             UPDATE artists
-            SET report = ?,
+            SET coverage_json = ?,
                 enrichment_timestamp = ?
             WHERE id = ?
             """,
-            (report, timestamp, artist_id),
+            (coverage_json, timestamp, artist_id),
         )
         conn.commit()
 
-        # Display a preview of the first line of the report
-        first_line = content.split("\n")[0].strip()
-        preview = first_line[:80] + ("…" if len(first_line) > 80 else "")
-        print(f"   -> {preview}")
-        print(f"   -> {len(citations)} citation(s)")
+        # Display a preview
+        genres = ", ".join(result.get("genres", []))
+        covered_pubs = [
+            c["publication"]
+            for c in result.get("coverage", [])
+            if c.get("covered")
+        ]
+        covered_str = ", ".join(covered_pubs) if covered_pubs else "none"
+        print(f"   -> Genres: {genres}")
+        print(f"   -> Coverage: {covered_str}")
+        print(f"   -> {len(result.get('citations', []))} citation(s)")
         print(f"   -> ENRICHED OK\n")
         success_count += 1
 

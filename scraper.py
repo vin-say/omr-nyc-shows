@@ -55,6 +55,12 @@ def init_db(db_name="concerts.db"):
         )
     ''')
 
+    # Add structured JSON column for artist enrichment (v2 format)
+    try:
+        cursor.execute("ALTER TABLE artists ADD COLUMN coverage_json TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

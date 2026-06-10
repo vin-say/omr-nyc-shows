@@ -48,7 +48,7 @@ Shows are sorted into four tiers:
 
 **Priority venues** are defined in `priority_venues.yaml` (editable without touching code).
 
-**Media coverage** is detected by scanning each artist's Perplexity research report for mentions of: Pitchfork, Brooklyn Vegan, Bandcamp Daily, Resident Advisor, and KEXP. A negative-phrase regex filter determines whether a mention indicates actual coverage vs. explicit "no evidence found" language.
+**Media coverage** is detected from the structured JSON enrichment data — any artist with at least one `covered: true` entry is considered media-covered. A legacy fallback uses negative-phrase regex scanning for older free-form reports.
 
 ### Artist Enrichment Eligibility
 
@@ -83,7 +83,8 @@ Not every artist on every bill gets enriched. Eligibility depends on venue size 
 | name | TEXT | Artist/band name |
 | omr_id | INTEGER UNIQUE | Oh My Rockness internal band ID |
 | omr_slug | TEXT | OMR URL slug (e.g., `death-from-above-1979`) |
-| report | TEXT | Markdown research report from Perplexity (genres + media coverage) |
+| report | TEXT | Legacy free-form Markdown report (deprecated, kept for reference) |
+| coverage_json | TEXT | Structured JSON: genres, publication coverage, and citation URLs |
 | enrichment_timestamp | TEXT | ISO timestamp of when artist was enriched |
 
 ### `shows`
@@ -223,7 +224,7 @@ The `curl_cffi` library is used with Chrome impersonation to bypass Cloudflare p
 
 **Venues** are enriched via Perplexity Sonar Pro with structured JSON output. The prompt asks for address, whether the venue is primarily a music venue, a description of the venue type, and a capacity tier classification.
 
-**Artists** are enriched via Perplexity Sonar (standard) with medium search context. The prompt asks for genres and whether the artist has been discussed in five specific music publications. The response is stored as a Markdown report with inline citation numbers mapped to source URLs.
+**Artists** are enriched via Perplexity Sonar (standard) with high search context and structured JSON output. The JSON schema enforces a consistent format with two fields: `genres` (array of specific genre labels) and `coverage` (array of objects with `publication`, `covered` boolean, `context` description, and `citation_index`). The Perplexity citations array is embedded in the stored JSON so the newsletter renderer can produce inline hyperlinks. Only publications where `covered=true` are shown in the newsletter — "no evidence" entries are silently omitted.
 
 ### Newsletter Generation
 

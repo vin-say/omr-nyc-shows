@@ -19,6 +19,7 @@ Usage:
 import sqlite3
 import os
 import re
+import json
 import argparse
 from datetime import datetime
 
@@ -42,7 +43,7 @@ PUBLICATIONS = [
 ]
 
 # Phrases that indicate NO coverage when found on the same line as a
-# publication name.  If none of these appear, we assume coverage exists.
+# publication name.  Used as a fallback for legacy free-form reports.
 _NEGATIVE_PHRASES = [
     "no evidence",
     "not find",
@@ -83,12 +84,25 @@ def load_priority_venues(path: str = PRIORITY_VENUES_FILE) -> set[str]:
     return {v.strip().lower() for v in venues}
 
 
-def _has_media_coverage(report: str | None) -> bool:
-    """
-    Determine whether an artist's Perplexity report indicates coverage
-    in at least one of the target publications.
+# ---------------------------------------------------------------------------
+# Coverage detection
+# ---------------------------------------------------------------------------
+def _has_media_coverage_json(coverage_json: str | None) -> bool:
+    """Check structured JSON for at least one covered=true publication."""
+    if not coverage_json:
+        return False
+    try:
+        data = json.loads(coverage_json)
+        return any(c.get("covered") for c in data.get("coverage", []))
+    except (json.JSONDecodeError, TypeError):
+        return False
 
-    Strategy: for each publication, find the line that mentions it.
+
+def _has_media_coverage_legacy(report: str | None) -> bool:
+    """
+    Fallback: scan a free-form Markdown report for coverage mentions.
+
+    For each publication, find the line that mentions it.
     If the line does NOT contain any of the known negative phrases,
     the artist is considered to have coverage for that outlet.
     """
@@ -106,6 +120,13 @@ def _has_media_coverage(report: str | None) -> bool:
                     return True
                 break  # move to next publication
     return False
+
+
+def _has_media_coverage(coverage_json: str | None, report: str | None) -> bool:
+    """Determine if an artist has media coverage using the best available data."""
+    if coverage_json:
+        return _has_media_coverage_json(coverage_json)
+    return _has_media_coverage_legacy(report)
 
 
 # ---------------------------------------------------------------------------
@@ -149,15 +170,20 @@ def load_shows(conn: sqlite3.Connection, since_date: str | None = None) -> list[
     for show_id, show_date, ticket_url, source_url, venue_name in shows_raw:
         # Fetch artists for this show, ordered by bill position
         cursor.execute("""
-            SELECT a.name, a.report, sa.bill_order
+            SELECT a.name, a.report, a.coverage_json, sa.bill_order
             FROM show_artists sa
             JOIN artists a ON a.id = sa.artist_id
             WHERE sa.show_id = ?
             ORDER BY sa.bill_order
         """, (show_id,))
         artists = [
-            {"name": name, "report": report, "bill_order": bill_order}
-            for name, report, bill_order in cursor.fetchall()
+            {
+                "name": name,
+                "report": report,
+                "coverage_json": coverage_json,
+                "bill_order": bill_order,
+            }
+            for name, report, coverage_json, bill_order in cursor.fetchall()
         ]
 
         shows.append({
@@ -177,7 +203,7 @@ def load_shows(conn: sqlite3.Connection, since_date: str | None = None) -> list[
 # ---------------------------------------------------------------------------
 def score_show(show: dict, priority_venues: set[str]) -> int:
     """
-    Assign a tier (1–4) to a show.
+    Assign a tier (1-4) to a show.
 
     1 = priority venue AND media coverage
     2 = media coverage only
@@ -186,7 +212,8 @@ def score_show(show: dict, priority_venues: set[str]) -> int:
     """
     is_priority = show["venue"].strip().lower() in priority_venues
     has_coverage = any(
-        _has_media_coverage(a["report"]) for a in show["artists"]
+        _has_media_coverage(a.get("coverage_json"), a.get("report"))
+        for a in show["artists"]
     )
 
     if is_priority and has_coverage:
@@ -197,6 +224,63 @@ def score_show(show: dict, priority_venues: set[str]) -> int:
         return 3
     else:
         return 4
+
+
+# ---------------------------------------------------------------------------
+# Artist report rendering (from structured JSON)
+# ---------------------------------------------------------------------------
+def _render_artist_from_json(coverage_json: str) -> str | None:
+    """
+    Render an artist's structured JSON enrichment data into clean Markdown.
+
+    Only includes publications where covered=true, with inline hyperlinks.
+    Returns None if there's nothing meaningful to show.
+    """
+    try:
+        data = json.loads(coverage_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    genres = data.get("genres", [])
+    coverage = data.get("coverage", [])
+    citations = data.get("citations", [])
+
+    # Filter out placeholder/meaningless genre entries
+    genres = [g for g in genres if g.lower() not in ("unknown", "n/a", "none", "")]
+
+    lines = []
+
+    # Genres line
+    if genres:
+        lines.append(f"**Genres:** {', '.join(genres)}")
+
+    # Coverage — only show publications that DID cover the artist
+    covered_items = [c for c in coverage if c.get("covered")]
+    if covered_items:
+        lines.append("")
+        lines.append("**Coverage:**")
+        for item in covered_items:
+            pub = item["publication"]
+            context = item.get("context") or ""
+            citation_idx = item.get("citation_index")
+
+            # Build inline hyperlink from citation index
+            if citation_idx and 1 <= citation_idx <= len(citations):
+                url = citations[citation_idx - 1]
+                if context:
+                    lines.append(f"- **{pub}**: {context} ([source]({url}))")
+                else:
+                    lines.append(f"- **{pub}**: [source]({url})")
+            else:
+                if context:
+                    lines.append(f"- **{pub}**: {context}")
+                else:
+                    lines.append(f"- **{pub}**")
+
+    if not lines:
+        return None
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -231,19 +315,33 @@ def _render_show_markdown(show: dict) -> str:
         lines.append(f"[Tickets]({show['ticket_url']})")
         lines.append("")
 
-    # Artist reports (for every artist that has one)
-    artists_with_reports = [a for a in show["artists"] if a["report"]]
-    for artist in artists_with_reports:
-        report = artist["report"].strip()
+    # Artist reports — prefer structured JSON, fall back to legacy Markdown
+    artists_with_info = []
+    for artist in show["artists"]:
+        rendered = None
+        if artist.get("coverage_json"):
+            rendered = _render_artist_from_json(artist["coverage_json"])
+        elif artist.get("report"):
+            # Legacy fallback: show the old free-form report in a blockquote
+            rendered = artist["report"].strip()
 
-        # If only one artist has a report, no need for a sub-heading
-        if len(artists_with_reports) > 1:
-            lines.append(f"**About {artist['name']}:**")
+        if rendered:
+            artists_with_info.append((artist["name"], rendered, bool(artist.get("coverage_json"))))
+
+    for artist_name, rendered, is_json in artists_with_info:
+        # If multiple artists have info, add a sub-heading
+        if len(artists_with_info) > 1:
+            lines.append(f"**{artist_name}:**")
             lines.append("")
 
-        # Indent the report into a blockquote so it's visually distinct
-        for report_line in report.split("\n"):
-            lines.append(f"> {report_line}")
+        if is_json:
+            # Structured data — render directly (no blockquote needed, it's clean)
+            for line in rendered.split("\n"):
+                lines.append(f"> {line}")
+        else:
+            # Legacy free-form report — blockquote it
+            for line in rendered.split("\n"):
+                lines.append(f"> {line}")
         lines.append("")
 
     lines.append("---")
@@ -341,11 +439,12 @@ HTML_WRAPPER = """\
     background: #fafafa;
     font-size: 0.92em;
   }}
-  blockquote h2 {{
-    color: #444;
-    font-size: 1em;
-    border-bottom: none;
-    margin-top: 0.8rem;
+  blockquote p {{
+    margin: 0.3rem 0;
+  }}
+  blockquote ul {{
+    margin: 0.3rem 0;
+    padding-left: 1.2rem;
   }}
   a {{
     color: #b33;
