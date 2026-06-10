@@ -1,0 +1,4 @@
+curl-cffi
+python-dotenv
+pyyaml
+markdown
