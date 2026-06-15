@@ -26,6 +26,7 @@ import os
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
+import yaml
 from dotenv import load_dotenv
 from curl_cffi import requests as cffi_requests
 
@@ -44,6 +45,17 @@ PUBLICATIONS = [
     "Resident Advisor",
     "KEXP",
 ]
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PRIORITY_VENUES_FILE = os.path.join(SCRIPT_DIR, "priority_venues.yaml")
+
+
+def load_blacklisted_venues(path: str = PRIORITY_VENUES_FILE) -> set[str]:
+    """Load the blacklisted venue list from the YAML config file."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    venues = data.get("blacklisted_venues", [])
+    return {v.strip().lower() for v in venues}
 
 
 def _load_perplexity_key() -> str:
@@ -257,6 +269,7 @@ ELIGIBLE_ARTISTS_SQL = """
     JOIN shows s ON s.id = sa.show_id
     JOIN venues v ON v.id = s.venue_id
     WHERE a.enrichment_timestamp IS NULL
+      AND LOWER(TRIM(v.name)) NOT IN ({blacklist_placeholders})
       AND (
           -- Large / Major: always enrich
           v.capacity_tier IN ('Large', 'Major')
@@ -278,8 +291,17 @@ def enrich_unenriched_artists(conn: sqlite3.Connection):
 
     Commits after each successful enrichment so progress is never lost.
     """
+    blacklisted = load_blacklisted_venues()
+    if blacklisted:
+        placeholders = ",".join("?" * len(blacklisted))
+        sql = ELIGIBLE_ARTISTS_SQL.format(blacklist_placeholders=placeholders)
+        params = list(blacklisted)
+    else:
+        sql = ELIGIBLE_ARTISTS_SQL.format(blacklist_placeholders="''")
+        params = []
+
     cursor = conn.cursor()
-    cursor.execute(ELIGIBLE_ARTISTS_SQL)
+    cursor.execute(sql, params)
     unenriched = cursor.fetchall()
 
     if not unenriched:
