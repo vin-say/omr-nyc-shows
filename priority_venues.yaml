@@ -20,3 +20,15 @@ priority_venues:
   - Brooklyn Monarch
   - Warsaw
   - Roulette
+
+# Blacklisted venues — shows at these venues are completely excluded from:
+#   1. The newsletter (not rendered at all)
+#   2. Artist enrichment (no Perplexity API calls spent on their artists)
+
+blacklisted_venues:
+  - Tompkins Square Park
+  - Flushing Meadows-Corona Park
+  - Pacha New York
+  - House of Yes
+  - Barclays Center
+  - Madison Square Garden

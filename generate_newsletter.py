@@ -80,7 +80,14 @@ def load_priority_venues(path: str = PRIORITY_VENUES_FILE) -> set[str]:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     venues = data.get("priority_venues", [])
-    # Normalise to lowercase for case-insensitive matching
+    return {v.strip().lower() for v in venues}
+
+
+def load_blacklisted_venues(path: str = PRIORITY_VENUES_FILE) -> set[str]:
+    """Load the blacklisted venue list from the YAML config file."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    venues = data.get("blacklisted_venues", [])
     return {v.strip().lower() for v in venues}
 
 
@@ -484,12 +491,16 @@ def main():
 
     # Load data
     priority_venues = load_priority_venues()
+    blacklisted_venues = load_blacklisted_venues()
     conn = sqlite3.connect(args.db)
     conn.execute("PRAGMA foreign_keys = ON;")
     shows = load_shows(conn, since_date=args.since)
     conn.close()
 
-    print(f"Loaded {len(shows)} shows and {len(priority_venues)} priority venues.")
+    # Filter out blacklisted venues
+    shows = [s for s in shows if s["venue"].strip().lower() not in blacklisted_venues]
+
+    print(f"Loaded {len(shows)} shows ({len(blacklisted_venues)} blacklisted venues filtered).")
 
     # Generate
     md_text = render_newsletter_markdown(shows, priority_venues)
