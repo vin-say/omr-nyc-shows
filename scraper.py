@@ -59,7 +59,13 @@ def init_db(db_name="concerts.db"):
     try:
         cursor.execute("ALTER TABLE artists ADD COLUMN coverage_json TEXT")
     except sqlite3.OperationalError:
-        pass  # column already exists
+        pass
+
+    for col_name in ("spotify_url", "youtube_url"):
+        try:
+            cursor.execute(f"ALTER TABLE artists ADD COLUMN {col_name} TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shows (
