@@ -28,7 +28,8 @@ os.chdir(SCRIPT_DIR)
 from scraper import init_db, scrape_oh_my_rockness, get_or_create_venue, get_or_create_artist, insert_show, link_artist_to_show
 from enrich_venues import enrich_unenriched_venues
 from enrich_artists import enrich_unenriched_artists
-from generate_newsletter import load_priority_venues, load_shows, render_newsletter_markdown, convert_to_html, score_show, TIER_LABELS
+from enrich_links import enrich_links
+from generate_newsletter import load_priority_venues, load_blacklisted_venues, load_shows, render_newsletter_markdown, convert_to_html, score_show, TIER_LABELS
 from send_email import send_newsletter_email
 
 # ---------------------------------------------------------------------------
@@ -155,6 +156,10 @@ def run():
     log.info("Step 3: Enriching eligible new artists...")
     enrich_unenriched_artists(conn)
 
+    # --- Step 3b: Enrich artist links (Spotify + YouTube) ---
+    log.info("Step 3b: Enriching artist links (Spotify + YouTube)...")
+    enrich_links(conn)
+
     # --- Step 4: Generate newsletter (only new shows) ---
     log.info("Step 4: Generating newsletter...")
     last_sent = _get_last_sent_date(conn)
@@ -164,7 +169,11 @@ def run():
         log.info("No previous newsletter found. Including all shows.")
 
     priority_venues = load_priority_venues()
+    blacklisted_venues = load_blacklisted_venues()
     shows = load_shows(conn, since_date=last_sent)
+
+    # Filter out blacklisted venues
+    shows = [s for s in shows if s["venue"].strip().lower() not in blacklisted_venues]
 
     if not shows:
         log.info("No shows to include in newsletter after date filtering. Exiting.")

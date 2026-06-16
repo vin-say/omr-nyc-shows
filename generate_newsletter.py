@@ -177,7 +177,8 @@ def load_shows(conn: sqlite3.Connection, since_date: str | None = None) -> list[
     for show_id, show_date, ticket_url, source_url, venue_name in shows_raw:
         # Fetch artists for this show, ordered by bill position
         cursor.execute("""
-            SELECT a.name, a.report, a.coverage_json, sa.bill_order
+            SELECT a.name, a.report, a.coverage_json, sa.bill_order,
+                   a.spotify_url, a.youtube_url
             FROM show_artists sa
             JOIN artists a ON a.id = sa.artist_id
             WHERE sa.show_id = ?
@@ -189,8 +190,11 @@ def load_shows(conn: sqlite3.Connection, since_date: str | None = None) -> list[
                 "report": report,
                 "coverage_json": coverage_json,
                 "bill_order": bill_order,
+                "spotify_url": spotify_url,
+                "youtube_url": youtube_url,
             }
-            for name, report, coverage_json, bill_order in cursor.fetchall()
+            for name, report, coverage_json, bill_order, spotify_url, youtube_url
+            in cursor.fetchall()
         ]
 
         shows.append({
@@ -329,26 +333,40 @@ def _render_show_markdown(show: dict) -> str:
         if artist.get("coverage_json"):
             rendered = _render_artist_from_json(artist["coverage_json"])
         elif artist.get("report"):
-            # Legacy fallback: show the old free-form report in a blockquote
             rendered = artist["report"].strip()
 
-        if rendered:
-            artists_with_info.append((artist["name"], rendered, bool(artist.get("coverage_json"))))
+        # Build listen links line
+        links = []
+        if artist.get("spotify_url"):
+            links.append(f"[Spotify]({artist['spotify_url']})")
+        if artist.get("youtube_url"):
+            links.append(f"[Live Video]({artist['youtube_url']})")
 
-    for artist_name, rendered, is_json in artists_with_info:
-        # If multiple artists have info, add a sub-heading
+        has_content = rendered or links
+        if has_content:
+            artists_with_info.append({
+                "name": artist["name"],
+                "rendered": rendered,
+                "is_json": bool(artist.get("coverage_json")),
+                "links": links,
+            })
+
+    for info in artists_with_info:
         if len(artists_with_info) > 1:
-            lines.append(f"**{artist_name}:**")
+            lines.append(f"**{info['name']}:**")
             lines.append("")
 
-        if is_json:
-            # Structured data — render directly (no blockquote needed, it's clean)
-            for line in rendered.split("\n"):
+        if info["rendered"]:
+            for line in info["rendered"].split("\n"):
                 lines.append(f"> {line}")
-        else:
-            # Legacy free-form report — blockquote it
-            for line in rendered.split("\n"):
-                lines.append(f"> {line}")
+
+        if info["links"]:
+            links_line = " | ".join(info["links"])
+            if info["rendered"]:
+                lines.append(f"> ")
+                lines.append(f"> {links_line}")
+            else:
+                lines.append(f"> {links_line}")
         lines.append("")
 
     lines.append("---")
