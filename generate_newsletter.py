@@ -22,6 +22,7 @@ import re
 import json
 import argparse
 from datetime import datetime
+from urllib.parse import quote
 
 import yaml
 import markdown
@@ -311,6 +312,31 @@ def _format_date(date_str: str) -> str:
             return date_str
 
 
+def _build_gcal_url(show: dict) -> str:
+    """Build a Google Calendar 'Add Event' URL for a show."""
+    lineup = ", ".join(a["name"] for a in show["artists"])
+    title = f"[OMR] {lineup} @ {show['venue']}"
+    # All-day event: dates are YYYYMMDD/YYYYMMDD (end is exclusive, so +1 day)
+    try:
+        dt = datetime.strptime(show["show_date"], "%Y-%m-%d")
+        from datetime import timedelta
+        start = dt.strftime("%Y%m%d")
+        end = (dt + timedelta(days=1)).strftime("%Y%m%d")
+    except ValueError:
+        start = show["show_date"].replace("-", "")
+        end = start
+    dates = f"{start}/{end}"
+    params = (
+        f"action=TEMPLATE"
+        f"&text={quote(title)}"
+        f"&dates={dates}"
+        f"&location={quote(show['venue'])}"
+    )
+    if show.get("ticket_url"):
+        params += f"&details={quote(show['ticket_url'])}"
+    return f"https://calendar.google.com/calendar/render?{params}"
+
+
 def _render_show_markdown(show: dict) -> str:
     """Render a single show as a Markdown section."""
     lines = []
@@ -321,10 +347,13 @@ def _render_show_markdown(show: dict) -> str:
     lines.append(f"**{show['venue']}** — {_format_date(show['show_date'])}")
     lines.append("")
 
-    # Ticket link
+    # Ticket + calendar links
+    show_links = []
     if show["ticket_url"]:
-        lines.append(f"[Tickets]({show['ticket_url']})")
-        lines.append("")
+        show_links.append(f"[Tickets]({show['ticket_url']})")
+    show_links.append(f"[Add to Calendar]({_build_gcal_url(show)})")
+    lines.append(" | ".join(show_links))
+    lines.append("")
 
     # Artist reports — prefer structured JSON, fall back to legacy Markdown
     artists_with_info = []
