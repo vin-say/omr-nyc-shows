@@ -326,14 +326,42 @@ def _build_gcal_url(show: dict) -> str:
         start = show["show_date"].replace("-", "")
         end = start
     dates = f"{start}/{end}"
+
+    # Build event description with links and genre info per artist
+    details_parts = []
+    if show.get("ticket_url"):
+        details_parts.append(f"Tickets: {show['ticket_url']}")
+    for artist in show["artists"]:
+        artist_lines = []
+        if artist.get("coverage_json"):
+            try:
+                data = json.loads(artist["coverage_json"])
+                genres = [g for g in data.get("genres", [])
+                          if g.lower() not in ("unknown", "n/a", "none", "")]
+                if genres:
+                    artist_lines.append(f"Genres: {', '.join(genres)}")
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if artist.get("spotify_url"):
+            artist_lines.append(f"Spotify: {artist['spotify_url']}")
+        if artist.get("youtube_url"):
+            artist_lines.append(f"Live Video: {artist['youtube_url']}")
+        if artist_lines:
+            header = artist["name"] if len(show["artists"]) > 1 else ""
+            if header:
+                details_parts.append(f"\n{header}")
+            details_parts.extend(artist_lines)
+
+    details = "\n".join(details_parts)
+
     params = (
         f"action=TEMPLATE"
         f"&text={quote(title)}"
         f"&dates={dates}"
         f"&location={quote(show['venue'])}"
     )
-    if show.get("ticket_url"):
-        params += f"&details={quote(show['ticket_url'])}"
+    if details:
+        params += f"&details={quote(details)}"
     return f"https://calendar.google.com/calendar/render?{params}"
 
 
