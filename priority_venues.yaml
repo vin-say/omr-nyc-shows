@@ -20,6 +20,7 @@ priority_venues:
   - Brooklyn Monarch
   - Warsaw
   - Roulette
+  - Saint Vitus
 
 # Blacklisted venues — shows at these venues are completely excluded from:
 #   1. The newsletter (not rendered at all)
@@ -41,4 +42,6 @@ blacklisted_venues:
   - Jones Beach
   - PNC Bank Arts Center
   - P.I.T.
+  - Rough Trade NYC
+  - Maker Park
 
