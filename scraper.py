@@ -283,13 +283,13 @@ if __name__ == "__main__":
     
     # Enrich any venues that haven't been enriched yet
     print("\n" + "="*50)
-    print("Starting venue enrichment via Perplexity Sonar API...")
+    print("Starting venue enrichment via Perplexity Agent API...")
     print("="*50)
     enrich_unenriched_venues(conn)
 
     # Enrich eligible artists (depends on venue capacity data, so runs after venues)
     print("\n" + "="*50)
-    print("Starting artist enrichment via Perplexity Sonar API...")
+    print("Starting artist enrichment via Perplexity Agent API...")
     print("="*50)
     enrich_unenriched_artists(conn)
 

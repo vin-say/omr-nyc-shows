@@ -19,8 +19,8 @@ Oh My Rockness publishes a rolling "Just Announced" feed of upcoming NYC shows, 
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  1. scraper.py          → Scrape OMR JSON API, insert new shows     │
-│  2. enrich_venues.py    → Perplexity Sonar Pro: venue metadata      │
-│  3. enrich_artists.py   → Perplexity Sonar: artist reports          │
+│  2. enrich_venues.py    → Perplexity Agent API: venue metadata      │
+│  3. enrich_artists.py   → Perplexity Agent API: artist reports      │
 │  4. generate_newsletter.py → Score, tier, render Markdown + HTML    │
 │  5. send_email.py       → Gmail SMTP delivery                       │
 │                                                                     │
@@ -30,8 +30,8 @@ Oh My Rockness publishes a rolling "Just Announced" feed of upcoming NYC shows, 
 ### Data Flow
 
 ```
-OMR JSON API → scraper.py → concerts.db → enrich_venues.py  (Perplexity Sonar Pro)
-                                        → enrich_artists.py (Perplexity Sonar)
+OMR JSON API → scraper.py → concerts.db → enrich_venues.py  (Perplexity Agent API)
+                                        → enrich_artists.py (Perplexity Agent API)
                                         → generate_newsletter.py → HTML email
 ```
 
@@ -123,8 +123,8 @@ Composite primary key on (show_id, artist_id).
 ```
 NYC Concert Tracker/
 ├── scraper.py              # OMR JSON API scraper + DB schema init
-├── enrich_venues.py        # Venue enrichment via Perplexity Sonar Pro
-├── enrich_artists.py       # Artist enrichment via Perplexity Sonar
+├── enrich_venues.py        # Venue enrichment via Perplexity Agent API
+├── enrich_artists.py       # Artist enrichment via Perplexity Agent API
 ├── generate_newsletter.py  # Scoring, Markdown/HTML rendering
 ├── send_email.py           # Gmail SMTP email delivery
 ├── run_daily.py            # Daily orchestrator (calls all of the above)
@@ -222,9 +222,9 @@ The `curl_cffi` library is used with Chrome impersonation to bypass Cloudflare p
 
 ### Enrichment
 
-**Venues** are enriched via Perplexity Sonar Pro with structured JSON output. The prompt asks for address, whether the venue is primarily a music venue, a description of the venue type, and a capacity tier classification.
+**Venues** are enriched via the Perplexity Agent API (`perplexity/sonar` with a forced `web_search` tool) with structured JSON output. The prompt asks for address, whether the venue is primarily a music venue, a description of the venue type, and a capacity tier classification.
 
-**Artists** are enriched via Perplexity Sonar (standard) with high search context and structured JSON output. The JSON schema enforces a consistent format with two fields: `genres` (array of specific genre labels) and `coverage` (array of objects with `publication`, `covered` boolean, `context` description, and `citation_index`). The Perplexity citations array is embedded in the stored JSON so the newsletter renderer can produce inline hyperlinks. Only publications where `covered=true` are shown in the newsletter — "no evidence" entries are silently omitted.
+**Artists** are enriched via the Perplexity Agent API (`perplexity/sonar` with a forced `web_search` tool) with high search context and structured JSON output. The JSON schema enforces a consistent format with two fields: `genres` (array of specific genre labels) and `coverage` (array of objects with `publication`, `covered` boolean, `context` description, and `citation_index`). Citation URLs from the response's `search_results` output item are embedded in the stored JSON so the newsletter renderer can produce inline hyperlinks. Only publications where `covered=true` are shown in the newsletter — "no evidence" entries are silently omitted.
 
 ### Newsletter Generation
 
