@@ -1,5 +1,5 @@
 """
-Venue enrichment module using Perplexity Sonar Pro API.
+Venue enrichment module using the Perplexity Agent API (perplexity/sonar + web_search).
 
 Looks up each unenriched venue in the SQLite database and populates:
   - address
@@ -25,8 +25,8 @@ from curl_cffi import requests as cffi_requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_MODEL = "sonar-pro"
+PERPLEXITY_API_URL = "https://api.perplexity.ai/v1/agent"
+PERPLEXITY_MODEL = "perplexity/sonar"
 SEARCH_CONTEXT_SIZE = "medium"
 DELAY_BETWEEN_CALLS = 1  # seconds between Perplexity API calls
 
@@ -117,7 +117,7 @@ def _build_prompt(venue_name: str) -> str:
 
 def enrich_venue(venue_name: str, api_key: str) -> dict | None:
     """
-    Call Perplexity Sonar Pro to look up metadata for a single venue.
+    Call the Perplexity Agent API to look up metadata for a single venue.
 
     Returns a dict with keys: address, is_primary_music_venue,
     venue_type_notes, capacity_tier.  Returns None on any failure.
@@ -129,7 +129,7 @@ def enrich_venue(venue_name: str, api_key: str) -> dict | None:
 
     payload = {
         "model": PERPLEXITY_MODEL,
-        "messages": [
+        "input": [
             {
                 "role": "system",
                 "content": (
@@ -144,9 +144,11 @@ def enrich_venue(venue_name: str, api_key: str) -> dict | None:
                 "content": _build_prompt(venue_name),
             },
         ],
-        "web_search_options": {
-            "search_context_size": SEARCH_CONTEXT_SIZE,
-        },
+        "tools": [
+            {"type": "web_search", "search_context_size": SEARCH_CONTEXT_SIZE},
+        ],
+        # Force a search so venue details are grounded, not guessed
+        "tool_choice": {"type": "web_search"},
         "response_format": {
             "type": "json_schema",
             "json_schema": VENUE_JSON_SCHEMA,
@@ -180,11 +182,23 @@ def enrich_venue(venue_name: str, api_key: str) -> dict | None:
         print(f"   [!] Failed to decode API response for '{venue_name}': {e}")
         return None
 
+    # Failed/cancelled runs arrive as HTTP 200 — branch on status
+    if body.get("status") != "completed":
+        print(
+            f"   [!] API run not completed for '{venue_name}': "
+            f"status={body.get('status')} error={body.get('error')} "
+            f"incomplete_details={body.get('incomplete_details')}"
+        )
+        return None
+
     # Extract the assistant message content
-    try:
-        content = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        print(f"   [!] Unexpected API response structure for '{venue_name}': {e}")
+    content = "".join(
+        part.get("text", "")
+        for item in body.get("output", []) if item.get("type") == "message"
+        for part in item.get("content", []) if part.get("type") == "output_text"
+    )
+    if not content:
+        print(f"   [!] Unexpected API response structure for '{venue_name}': no output text")
         return None
 
     # Parse the structured JSON from the content string

@@ -1,7 +1,7 @@
 """
-Artist enrichment module using Perplexity Sonar API.
+Artist enrichment module using the Perplexity Agent API (perplexity/sonar + web_search).
 
-For each eligible artist, queries Sonar to produce a structured JSON report
+For each eligible artist, queries the Agent API to produce a structured JSON report
 covering:
   - Genre(s) associated with the artist
   - Whether the artist has been discussed or featured in:
@@ -14,8 +14,8 @@ position on the bill (bill_order in show_artists):
   - Large / Major venues:        all artists on the bill
   - Unknown / NULL tier:          all artists (always enrich)
 
-The structured JSON is stored in artists.coverage_json.  The Perplexity
-citations array is embedded in the JSON so the newsletter renderer can
+The structured JSON is stored in artists.coverage_json.  Citation URLs
+from the Agent API's search_results output are embedded in the JSON so the newsletter renderer can
 produce inline hyperlinks.
 """
 
@@ -33,8 +33,8 @@ from curl_cffi import requests as cffi_requests
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_MODEL = "sonar"
+PERPLEXITY_API_URL = "https://api.perplexity.ai/v1/agent"
+PERPLEXITY_MODEL = "perplexity/sonar"
 SEARCH_CONTEXT_SIZE = "high"
 DELAY_BETWEEN_CALLS = 1  # seconds between API calls
 
@@ -168,7 +168,7 @@ def _build_prompt(artist_name: str) -> str:
 # ---------------------------------------------------------------------------
 def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
     """
-    Call Perplexity Sonar for a single artist with structured JSON output.
+    Call the Perplexity Agent API for a single artist with structured JSON output.
 
     Returns a dict with keys: genres, coverage, citations.
     Returns None on failure.
@@ -180,7 +180,7 @@ def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
 
     payload = {
         "model": PERPLEXITY_MODEL,
-        "messages": [
+        "input": [
             {
                 "role": "system",
                 "content": (
@@ -197,9 +197,11 @@ def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
                 "content": _build_prompt(artist_name),
             },
         ],
-        "web_search_options": {
-            "search_context_size": SEARCH_CONTEXT_SIZE,
-        },
+        "tools": [
+            {"type": "web_search", "search_context_size": SEARCH_CONTEXT_SIZE},
+        ],
+        # Force a search: citations depend on search results
+        "tool_choice": {"type": "web_search"},
         "response_format": {
             "type": "json_schema",
             "json_schema": ARTIST_JSON_SCHEMA,
@@ -233,11 +235,24 @@ def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
         print(f"   [!] Failed to decode API response for '{artist_name}': {e}")
         return None
 
+    # Failed/cancelled runs arrive as HTTP 200 — branch on status
+    if body.get("status") != "completed":
+        print(
+            f"   [!] API run not completed for '{artist_name}': "
+            f"status={body.get('status')} error={body.get('error')} "
+            f"incomplete_details={body.get('incomplete_details')}"
+        )
+        return None
+
     # Extract the structured JSON content
-    try:
-        content = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        print(f"   [!] Unexpected API response structure for '{artist_name}': {e}")
+    output = body.get("output", [])
+    content = "".join(
+        part.get("text", "")
+        for item in output if item.get("type") == "message"
+        for part in item.get("content", []) if part.get("type") == "output_text"
+    )
+    if not content:
+        print(f"   [!] Unexpected API response structure for '{artist_name}': no output text")
         return None
 
     try:
@@ -252,9 +267,12 @@ def _call_perplexity(artist_name: str, api_key: str) -> dict | None:
         print(f"   [!] Missing required keys in response for '{artist_name}'")
         return None
 
-    # Attach the citations array from the Perplexity response
-    citations = body.get("citations", [])
-    data["citations"] = citations
+    # Attach citation URLs from the search_results output item
+    results = next(
+        (item.get("results", []) for item in output if item.get("type") == "search_results"),
+        [],
+    )
+    data["citations"] = [r["url"] for r in results if r.get("url")]
 
     return data
 
@@ -287,7 +305,7 @@ ELIGIBLE_ARTISTS_SQL = """
 
 def enrich_unenriched_artists(conn: sqlite3.Connection):
     """
-    Find all eligible, unenriched artists and enrich them via Perplexity Sonar.
+    Find all eligible, unenriched artists and enrich them via the Perplexity Agent API.
 
     Commits after each successful enrichment so progress is never lost.
     """
